@@ -65,40 +65,44 @@
     "therefore"
   ]);
 
+  const API_BASE_URL = "http://localhost:8000/api";
+  const API_TIMEOUT_MS = 12000;
+  const REPORT_SECTIONS = [
+    "background",
+    "engagements",
+    "motivations",
+    "communication",
+    "outreach",
+    "takeaways",
+    "hooks",
+    "highlights"
+  ];
+
   const state = {
     open: true,
+    activeTab: localStorage.getItem('dealynx-active-tab') || 'insights',
     sessionActive: false,
     sessionStartedAt: null,
     captures: [],
-    report: {
-      profile: {
-        name: "Not captured yet",
-        role: "Awaiting capture",
-        company: "Awaiting capture",
-        summary: "Begin a session and capture views you'd like DeaLynx to analyse.",
-        location: "—"
-      },
-      background: [],
-      engagements: [],
-      motivations: [],
-      communication: [],
-      outreach: [],
-      takeaways: [],
-      hooks: [],
-      highlights: [],
-      keywords: [],
-      metrics: {
-        engagementScore: 0,
-        sentiment: "Neutral",
-        freshness: "No data yet"
-      }
+    report: createEmptyReport(),
+    reportReady: false,
+    loadingFlags: {
+      connecting: false,
+      capturing: false,
+      fetchingReport: false
+    },
+    backend: {
+      sessionId: null,
+      status: "idle",
+      error: null
     },
     chatHistory: [
       {
         sender: "agent",
-        text: "Hi! Start a session and capture the pages you want summarised. I’ll queue insights based on what you gather."
+        text: "Welcome! Begin a session, capture relevant pages, and I'll generate insights for you."
       }
-    ]
+    ],
+    insights: []
   };
 
   let ui = {};
@@ -110,139 +114,64 @@
     sidebar.innerHTML = `
       <div class="dealynx-header">
         <div class="dealynx-brand">
-          <div class="dealynx-logo">DL</div>
-          <div class="dealynx-title">
-            <strong>DeaLynx</strong>
-            <span>Prospect Intelligence</span>
-          </div>
+          <img src="${chrome.runtime.getURL('logo.png')}" alt="DeaLynx Logo" class="dealynx-logo-img" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';" />
+          <span class="dealynx-brand-text" style="display: none;">DeaLynx</span>
         </div>
-        <div class="dealynx-header-actions">
-          <button class="dealynx-icon-button" title="Collapse" data-action="collapse">❯</button>
+        <div class="dealynx-tabs">
+          <button class="dealynx-tab dealynx-tab-active" data-tab="insights">Insights</button>
+          <button class="dealynx-tab" data-tab="chat">Chat</button>
         </div>
+        <button class="dealynx-icon-button" title="Close" data-action="collapse">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
       </div>
-      <div class="dealynx-body" id="dealynx-scrollable">
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Session Controls</h2>
-            <span class="dealynx-pill" data-field="session-status">Idle</span>
-          </div>
-          <div class="dealynx-session-controls">
-            <button class="dealynx-button dealynx-button-primary" data-action="start-session">Start Session</button>
-            <button class="dealynx-button dealynx-button-secondary" data-action="capture-view" disabled>Capture View</button>
-            <button class="dealynx-button dealynx-button-tertiary" data-action="end-session" disabled>End Session</button>
-          </div>
-          <div class="dealynx-divider"></div>
-          <div class="dealynx-capture-timeline" data-field="capture-timeline">
-            <div class="dealynx-empty-state">No captures yet. Start a session to collect prospect context.</div>
-          </div>
-        </section>
 
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Profile Overview</h2>
-            <span class="dealynx-pill-success" data-field="engagement-score">Score: 0</span>
+      <div class="dealynx-tab-content dealynx-tab-content-active" data-tab-content="insights">
+        <div class="dealynx-controls-bar">
+          <div class="dealynx-connection-indicator" data-field="connection-status">
+            <span class="dealynx-connection-dot"></span>
+            <span data-field="connection-label">Ready</span>
           </div>
-          <div class="dealynx-section-content">
-            <div class="dealynx-key-value"><strong>Name</strong><span data-field="profile-name">Not captured yet</span></div>
-            <div class="dealynx-key-value"><strong>Role</strong><span data-field="profile-role">Awaiting capture</span></div>
-            <div class="dealynx-key-value"><strong>Company</strong><span data-field="profile-company">Awaiting capture</span></div>
-            <div class="dealynx-key-value"><strong>Location</strong><span data-field="profile-location">—</span></div>
-            <div class="dealynx-divider"></div>
-            <div data-field="profile-summary" class="dealynx-empty-state">Begin capturing to generate a summary.</div>
-            <div class="dealynx-metadata">
-              <div class="dealynx-key-value"><strong>Session length</strong><span data-field="session-duration">0m</span></div>
-              <div class="dealynx-key-value"><strong>Last capture</strong><span data-field="session-last-capture">Never</span></div>
+          <span class="dealynx-pill" data-field="session-status">Ready</span>
+        </div>
+
+        <div class="dealynx-session-controls">
+          <button class="dealynx-button dealynx-button-primary" data-action="start-session">Begin</button>
+          <button class="dealynx-button dealynx-button-outline" data-action="capture-view" disabled>Capture</button>
+          <button class="dealynx-button dealynx-button-destructive" data-action="end-session" disabled>Finish</button>
+        </div>
+
+        <div class="dealynx-body" id="dealynx-scrollable-insights">
+          <div class="dealynx-insights-container" data-field="insights-container">
+            <div class="dealynx-empty-insights">
+              <div class="dealynx-empty-insights-icon">📊</div>
+              <div class="dealynx-empty-insights-text">No insights yet.</div>
+              <button class="dealynx-button dealynx-button-primary dealynx-button-start-analysis" data-action="start-analysis">Start Analysis</button>
             </div>
           </div>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Professional Background</h2>
-            <span class="dealynx-pill">Career Signals</span>
-          </div>
-          <ul class="dealynx-report-list" data-field="background-list">
-            <li class="dealynx-empty-state">Insights will appear once captures are processed.</li>
-          </ul>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Engagement Insights</h2>
-            <span class="dealynx-pill">Audience Focus</span>
-          </div>
-          <ul class="dealynx-report-list" data-field="engagement-list">
-            <li class="dealynx-empty-state">Waiting for content to analyse.</li>
-          </ul>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Interests &amp; Motivations</h2>
-            <span class="dealynx-pill">Themes</span>
-          </div>
-          <ul class="dealynx-report-list" data-field="motivation-list">
-            <li class="dealynx-empty-state">Capture a profile to surface motivations.</li>
-          </ul>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Communication Style</h2>
-            <span class="dealynx-pill">Tone &amp; Cadence</span>
-          </div>
-          <ul class="dealynx-report-list" data-field="communication-list">
-            <li class="dealynx-empty-state">We’ll describe tone once text is captured.</li>
-          </ul>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Outreach Suggestions</h2>
-            <span class="dealynx-pill-warning">Draft Ideas</span>
-          </div>
-          <ul class="dealynx-report-list" data-field="outreach-list">
-            <li class="dealynx-empty-state">Capture context to generate suggestions.</li>
-          </ul>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Key Takeaways</h2>
-            <span class="dealynx-pill">Highlights</span>
-          </div>
-          <ul class="dealynx-report-list" data-field="takeaway-list">
-            <li class="dealynx-empty-state">Insights summary will appear here.</li>
-          </ul>
-          <div class="dealynx-divider"></div>
-          <div class="dealynx-badge-row" data-field="hooks-row"></div>
-        </section>
-
-        <section class="dealynx-section">
-          <div class="dealynx-section-header">
-            <h2>Recent Highlights</h2>
-            <span class="dealynx-pill">Contextual Quotes</span>
-          </div>
-          <div class="dealynx-section-content" data-field="highlight-cards">
-            <div class="dealynx-empty-state">We’ll surface notable snippets once captures are analysed.</div>
-          </div>
-        </section>
-      </div>
-      <div class="dealynx-chat">
-        <div class="dealynx-chat-history" data-field="chat-history"></div>
-        <div class="dealynx-chat-input">
-          <textarea data-field="chat-input" placeholder="Ask DeaLynx how to approach this prospect…"></textarea>
-          <button data-action="send-chat" disabled>Send</button>
         </div>
-        <div class="dealynx-footnote">Insights currently simulate the upcoming DeaLynx AI agent.</div>
+      </div>
+
+      <div class="dealynx-tab-content" data-tab-content="chat">
+        <div class="dealynx-chat-wrapper">
+          <div class="dealynx-chat-history" data-field="chat-history"></div>
+          <div class="dealynx-chat-input">
+            <textarea data-field="chat-input" placeholder="Ask about the prospect…"></textarea>
+            <button data-action="send-chat" disabled>Send</button>
+          </div>
+          <div class="dealynx-footnote">AI-powered prospect analysis</div>
+        </div>
       </div>
     `;
 
     const toggle = document.createElement("button");
     toggle.className = "dealynx-toggle dealynx-hidden";
     toggle.type = "button";
-    toggle.setAttribute("title", "Open DeaLynx workspace");
-    toggle.innerText = "DL";
+    toggle.setAttribute("title", "Open DeaLynx");
+    toggle.innerHTML = `
+      <img src="${chrome.runtime.getURL('logo.png')}" alt="DeaLynx" class="dealynx-toggle-logo" />
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+    `.trim();
     toggle.style.right = `${PANEL_WIDTH}px`;
 
     document.body.appendChild(sidebar);
@@ -255,34 +184,25 @@
     document.body.appendChild(topShadow);
     document.body.appendChild(bottomShadow);
 
+    const captureOverlay = document.createElement("div");
+    captureOverlay.className = "dealynx-capture-overlay";
+    document.body.appendChild(captureOverlay);
+
     ui = {
       sidebar,
       toggle,
       topShadow,
       bottomShadow,
-      scrollContainer: sidebar.querySelector("#dealynx-scrollable"),
+      captureOverlay,
+      scrollContainer: sidebar.querySelector("#dealynx-scrollable-insights"),
+      insightsTab: sidebar.querySelector('[data-tab="insights"]'),
+      chatTab: sidebar.querySelector('[data-tab="chat"]'),
+      insightsContent: sidebar.querySelector('[data-tab-content="insights"]'),
+      chatContent: sidebar.querySelector('[data-tab-content="chat"]'),
       sessionStatus: sidebar.querySelector('[data-field="session-status"]'),
-      startButton: sidebar.querySelector('[data-action="start-session"]'),
-      captureButton: sidebar.querySelector('[data-action="capture-view"]'),
-      endButton: sidebar.querySelector('[data-action="end-session"]'),
-      collapseButton: sidebar.querySelector('[data-action="collapse"]'),
-      captureTimeline: sidebar.querySelector('[data-field="capture-timeline"]'),
-      profileName: sidebar.querySelector('[data-field="profile-name"]'),
-      profileRole: sidebar.querySelector('[data-field="profile-role"]'),
-      profileCompany: sidebar.querySelector('[data-field="profile-company"]'),
-      profileLocation: sidebar.querySelector('[data-field="profile-location"]'),
-      profileSummary: sidebar.querySelector('[data-field="profile-summary"]'),
-      sessionDuration: sidebar.querySelector('[data-field="session-duration"]'),
-      sessionLastCapture: sidebar.querySelector('[data-field="session-last-capture"]'),
-      engagementScore: sidebar.querySelector('[data-field="engagement-score"]'),
-      backgroundList: sidebar.querySelector('[data-field="background-list"]'),
-      engagementList: sidebar.querySelector('[data-field="engagement-list"]'),
-      motivationList: sidebar.querySelector('[data-field="motivation-list"]'),
-      communicationList: sidebar.querySelector('[data-field="communication-list"]'),
-      outreachList: sidebar.querySelector('[data-field="outreach-list"]'),
-      takeawayList: sidebar.querySelector('[data-field="takeaway-list"]'),
-      hooksRow: sidebar.querySelector('[data-field="hooks-row"]'),
-      highlightCards: sidebar.querySelector('[data-field="highlight-cards"]'),
+      connectionStatus: sidebar.querySelector('[data-field="connection-status"]'),
+      connectionLabel: sidebar.querySelector('[data-field="connection-label"]'),
+      insightsContainer: sidebar.querySelector('[data-field="insights-container"]'),
       chatHistory: sidebar.querySelector('[data-field="chat-history"]'),
       chatInput: sidebar.querySelector('[data-field="chat-input"]'),
       chatSend: sidebar.querySelector('[data-action="send-chat"]')
@@ -294,11 +214,42 @@
   }
 
   function setupEventListeners() {
-    ui.startButton.addEventListener("click", startSession);
-    ui.captureButton.addEventListener("click", captureCurrentView);
-    ui.endButton.addEventListener("click", endSession);
-    ui.collapseButton.addEventListener("click", () => setOpenState(false));
+    // Set up event delegation for dynamically created buttons
+    ui.sidebar.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-action]");
+      if (!target) return;
+
+      const action = target.getAttribute("data-action");
+      console.log(`[DeaLynx] Button clicked: ${action}`);
+
+      switch (action) {
+        case "start-session":
+        case "start-analysis":
+          console.log('[DeaLynx] Starting session...');
+          startSession();
+          break;
+        case "capture-view":
+          console.log('[DeaLynx] Capturing view...');
+          captureCurrentView();
+          break;
+        case "end-session":
+          console.log('[DeaLynx] Ending session...');
+          endSession();
+          break;
+        case "collapse":
+          console.log('[DeaLynx] Closing sidebar...');
+          setOpenState(false);
+          break;
+        case "send-chat":
+          console.log('[DeaLynx] Sending chat message...');
+          sendChatMessage();
+          break;
+      }
+    });
+
     ui.toggle.addEventListener("click", () => setOpenState(true));
+    ui.insightsTab.addEventListener("click", () => switchTab("insights"));
+    ui.chatTab.addEventListener("click", () => switchTab("chat"));
     ui.chatInput.addEventListener("input", onChatInputChange);
     ui.chatInput.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
@@ -306,7 +257,6 @@
         sendChatMessage();
       }
     });
-    ui.chatSend.addEventListener("click", sendChatMessage);
     ui.scrollContainer.addEventListener("scroll", updateScrollShadows);
 
     chrome.runtime.onMessage.addListener((message) => {
@@ -314,6 +264,22 @@
         setOpenState(!state.open);
       }
     });
+
+    // Apply saved tab state
+    switchTab(state.activeTab);
+  }
+
+  function switchTab(tabName) {
+    state.activeTab = tabName;
+    localStorage.setItem('dealynx-active-tab', tabName);
+
+    // Update tab buttons
+    ui.insightsTab.classList.toggle("dealynx-tab-active", tabName === "insights");
+    ui.chatTab.classList.toggle("dealynx-tab-active", tabName === "chat");
+
+    // Update tab content
+    ui.insightsContent.classList.toggle("dealynx-tab-content-active", tabName === "insights");
+    ui.chatContent.classList.toggle("dealynx-tab-content-active", tabName === "chat");
   }
 
   function observeScroll() {
@@ -338,74 +304,218 @@
       ui.sidebar.classList.remove("dealynx-closed");
       ui.toggle.classList.add("dealynx-hidden");
       document.body.classList.add("dealynx-panel-open");
-      ui.collapseButton.innerText = "❯";
-      ui.collapseButton.setAttribute("title", "Collapse");
       ui.toggle.style.right = `${PANEL_WIDTH}px`;
     } else {
       ui.sidebar.classList.add("dealynx-closed");
       ui.toggle.classList.remove("dealynx-hidden");
       document.body.classList.remove("dealynx-panel-open");
-      ui.collapseButton.innerText = "❮";
-      ui.collapseButton.setAttribute("title", "Expand");
       ui.toggle.style.right = "0";
     }
     updateScrollShadows();
   }
 
-  function startSession() {
+  async function startSession() {
+    console.log('[DeaLynx] startSession() called');
+    if (state.loadingFlags.connecting) {
+      console.log('[DeaLynx] Already connecting, skipping...');
+      return;
+    }
+
+    console.log('[DeaLynx] Initializing session...');
     state.sessionActive = true;
     state.sessionStartedAt = Date.now();
     state.captures = [];
-    state.report = {
-      profile: {
-        name: "Capturing…",
-        role: "Capturing…",
-        company: "Capturing…",
-        summary: "Collect a few views to build an accurate profile overview.",
-        location: "—"
-      },
-      background: [],
-      engagements: [],
-      motivations: [],
-      communication: [],
-      outreach: [],
-      takeaways: [],
-      hooks: [],
-      highlights: [],
-      keywords: [],
-      metrics: {
-        engagementScore: 0,
-        sentiment: "Neutral",
-        freshness: "Awaiting capture"
-      }
+    state.report = createEmptyReport();
+    state.reportReady = false;
+    state.insights = [];
+    state.loadingFlags.connecting = true;
+    state.loadingFlags.fetchingReport = false;
+    state.loadingFlags.capturing = false;
+    state.backend = {
+      sessionId: null,
+      status: "connecting",
+      error: null
     };
-    addTimelineMessage("Session started. Navigate through the prospect’s footprint and capture relevant views.");
+    addTimelineMessage("Session started. Navigate through the prospect's footprint and capture relevant views.");
     renderAll();
+    console.log('[DeaLynx] Session initialized, connecting to backend...');
+
+    try {
+      const response = await createBackendSession();
+      const offline = Boolean(response?.__offline);
+      if (response && typeof response === "object") {
+        delete response.__offline;
+      }
+      state.backend.sessionId = response?.session_id || response?.sessionId || `stub-${Date.now()}`;
+      state.backend.status = offline ? "offline" : "ready";
+      if (offline) {
+        state.backend.error =
+          state.backend.error || new Error("Backend unreachable. Using offline stub response.");
+        addTimelineMessage("Backend unreachable. Operating in offline insight mode until connection is restored.", true);
+      } else {
+        addTimelineMessage("Connected to DeaLynx services. Captures will sync automatically.");
+      }
+    } catch (error) {
+      state.backend.sessionId = state.backend.sessionId || `stub-${Date.now()}`;
+      state.backend.status = "offline";
+      state.backend.error = error;
+      addTimelineMessage("Backend unreachable. Operating in offline insight mode until connection is restored.", true);
+    } finally {
+      state.loadingFlags.connecting = false;
+      renderAll();
+    }
   }
 
-  function endSession() {
-    if (!state.sessionActive) return;
+  async function endSession() {
+    if (!state.sessionActive || state.loadingFlags.fetchingReport) return;
     state.sessionActive = false;
     const totalCaptures = state.captures.length;
-    addTimelineMessage(
-      totalCaptures
-        ? `Session ended. ${totalCaptures} capture${totalCaptures === 1 ? "" : "s"} ready for analysis.`
-        : "Session ended with no captures."
-    );
+
+    if (!totalCaptures) {
+      state.report = createEmptyReport();
+      state.reportReady = true;
+      state.insights = [];
+      renderAll();
+      return;
+    }
+
+    state.loadingFlags.fetchingReport = true;
+    state.reportReady = false;
     renderAll();
+
+    try {
+      const backendReport = await fetchBackendReport(state.backend.sessionId, state.captures);
+      const offline = backendReport && typeof backendReport === "object" && backendReport.__offline;
+      if (offline) {
+        delete backendReport.__offline;
+        state.backend.status = "offline";
+        state.backend.error =
+          state.backend.error || new Error("Backend unreachable while requesting report.");
+        state.report = normaliseReportPayload(backendReport);
+      } else {
+        state.backend.status = "ready";
+        state.report = normaliseReportPayload(backendReport);
+      }
+      state.reportReady = true;
+      generateInsightsFromReport();
+    } catch (error) {
+      state.backend.error = error;
+      state.backend.status = "offline";
+      state.report = normaliseReportPayload(generateReportFromCaptures(state.captures));
+      state.reportReady = true;
+      generateInsightsFromReport();
+    } finally {
+      state.loadingFlags.fetchingReport = false;
+      renderAll();
+    }
   }
 
-  function captureCurrentView() {
+  function generateInsightsFromReport() {
+    const insights = [];
+
+    // Profile Overview
+    if (state.report.profile && state.report.profile.name) {
+      insights.push({
+        title: "Profile Overview",
+        summary: `${state.report.profile.name || 'Prospect'} - ${state.report.profile.role || ''} at ${state.report.profile.company || ''}. ${state.report.profile.summary || ''}`
+      });
+    }
+
+    // Professional Background
+    if (state.report.background && state.report.background.length > 0) {
+      insights.push({
+        title: "Professional Background",
+        summary: state.report.background.slice(0, 3).join(' ')
+      });
+    }
+
+    // Engagement Insights
+    if (state.report.engagements && state.report.engagements.length > 0) {
+      insights.push({
+        title: "Engagement Insights",
+        summary: state.report.engagements.slice(0, 3).join(' ')
+      });
+    }
+
+    // Motivations
+    if (state.report.motivations && state.report.motivations.length > 0) {
+      insights.push({
+        title: "Interests & Motivations",
+        summary: state.report.motivations.slice(0, 3).join(' ')
+      });
+    }
+
+    // Communication Style
+    if (state.report.communication && state.report.communication.length > 0) {
+      insights.push({
+        title: "Communication Style",
+        summary: state.report.communication.slice(0, 3).join(' ')
+      });
+    }
+
+    // Outreach Suggestions
+    if (state.report.outreach && state.report.outreach.length > 0) {
+      insights.push({
+        title: "Outreach Suggestions",
+        summary: state.report.outreach.slice(0, 3).join(' ')
+      });
+    }
+
+    // Key Takeaways
+    if (state.report.takeaways && state.report.takeaways.length > 0) {
+      insights.push({
+        title: "Key Takeaways",
+        summary: state.report.takeaways.slice(0, 3).join(' ')
+      });
+    }
+
+    // Highlights
+    if (state.report.highlights && state.report.highlights.length > 0) {
+      insights.push({
+        title: "Recent Highlights",
+        summary: state.report.highlights.map(h => h.text || '').join(' ')
+      });
+    }
+
+    state.insights = insights;
+  }
+
+  async function captureCurrentView() {
     if (!state.sessionActive) {
       addTimelineMessage("Start a session before capturing.", true);
       return;
     }
+    if (state.loadingFlags.capturing) return;
+
+    state.loadingFlags.capturing = true;
+    triggerCaptureOverlay();
+    renderAll();
 
     const capture = buildCaptureSnapshot();
     state.captures.push(capture);
-    updateReportFromCaptures();
     addTimelineCapture(capture);
     renderAll();
+
+    try {
+      const response = await sendCaptureToBackend(state.backend.sessionId, capture);
+      if (response && typeof response === "object") {
+        const offline = response.__offline;
+        delete response.__offline;
+        if (offline) {
+          state.backend.status = "offline";
+          state.backend.error =
+            state.backend.error || new Error("Backend unreachable during capture upload.");
+          addTimelineMessage("Capture stored locally. Backend will process once connectivity resumes.", true);
+        }
+      }
+    } catch (error) {
+      state.backend.error = error;
+      state.backend.status = "offline";
+      addTimelineMessage("Capture stored locally. Will retry upload when backend is reachable.", true);
+    } finally {
+      state.loadingFlags.capturing = false;
+      renderAll();
+    }
   }
 
   function buildCaptureSnapshot() {
@@ -438,6 +548,7 @@
       capturedAt,
       keywords,
       highlights,
+      rawText: fullText,
       sentiment: inferSentiment(fullText)
     };
   }
@@ -555,16 +666,20 @@
     return "—";
   }
 
-  function updateReportFromCaptures() {
-    if (state.captures.length === 0) {
-      return;
+  function generateReportFromCaptures(captures) {
+    const localCaptures = captures || [];
+    if (!localCaptures.length) {
+      const placeholder = createEmptyReport();
+      placeholder.profile.summary = "No captures were recorded during this session.";
+      return placeholder;
     }
-    const firstCapture = state.captures[0];
-    const latestCapture = state.captures[state.captures.length - 1];
+
+    const firstCapture = localCaptures[0];
+    const latestCapture = localCaptures[localCaptures.length - 1];
     const keywordFrequency = new Map();
     let optimisticMentions = 0;
 
-    state.captures.forEach((capture) => {
+    localCaptures.forEach((capture) => {
       capture.keywords.forEach((keyword, index) => {
         const weight = Math.max(1, 6 - index);
         keywordFrequency.set(keyword, (keywordFrequency.get(keyword) || 0) + weight);
@@ -576,10 +691,12 @@
       .sort((a, b) => b[1] - a[1])
       .map(([word]) => word);
 
-    const nameCandidate = detectNameFromHeading(firstCapture.primaryHeading) || detectNameFromHeading(firstCapture.headings[0]);
+    const nameCandidate =
+      detectNameFromHeading(firstCapture.primaryHeading) ||
+      detectNameFromHeading(firstCapture.headings?.[0]);
     const roleCandidate = detectRoleFromTitle(firstCapture.title) || detectRoleFromTitle(firstCapture.secondaryHeading);
     const companyCandidate = detectCompanyFromTitle(firstCapture.title);
-    const locationCandidate = detectLocationFromText(firstCapture.description || getPageTextContent(2000));
+    const locationCandidate = detectLocationFromText(firstCapture.description || firstCapture.rawText);
 
     const summary = buildSummarySnippet(latestCapture);
 
@@ -587,14 +704,17 @@
     const engagements = buildEngagementInsights(sortedKeywords);
     const motivations = buildMotivationInsights(sortedKeywords);
     const communication = buildCommunicationInsights(latestCapture);
-    const outreach = buildOutreachIdeas(sortedKeywords, nameCandidate || "the prospect");
-    const takeaways = buildTakeaways(sortedKeywords, state.captures.length);
+    const outreach = buildOutreachIdeas(sortedKeywords);
+    const takeaways = buildTakeaways(sortedKeywords, localCaptures.length);
     const hooks = buildConversationHooks(sortedKeywords, latestCapture);
-    const highlights = buildHighlightCards(state.captures);
+    const highlights = buildHighlightCards(localCaptures);
 
-    const engagementScore = Math.min(100, sortedKeywords.length * 8 + state.captures.length * 12 + optimisticMentions * 6);
+    const engagementScore = Math.min(
+      100,
+      sortedKeywords.length * 8 + localCaptures.length * 12 + optimisticMentions * 6
+    );
 
-    state.report = {
+    return {
       profile: {
         name: nameCandidate || firstCapture.primaryHeading || "Prospect profile",
         role: roleCandidate || "Role detected from captured pages",
@@ -671,11 +791,11 @@
     ];
   }
 
-  function buildOutreachIdeas(keywords, name) {
+  function buildOutreachIdeas(keywords) {
     if (!keywords.length) {
       return [
         "Capture a prospect page to unlock personalised outreach starters.",
-        "You’ll see suggested openers and follow-ups tailored to the captured content."
+        "You'll see suggested openers and follow-ups tailored to the captured content."
       ];
     }
     const primary = keywords[0];
@@ -683,7 +803,7 @@
     const tertiary = keywords[2] || secondary;
     return [
       `Open with a nod to their work in ${primary} and reference a recent win if available.`,
-      `Offer a quick insight or resource related to ${secondary} that proves you’ve done your homework.`,
+      `Offer a quick insight or resource related to ${secondary} that proves you've done your homework.`,
       `Highlight how you can reduce friction around ${tertiary}, then invite a short sync to explore fit.`
     ];
   }
@@ -744,36 +864,17 @@
   }
 
   function addTimelineMessage(message, isWarning = false) {
-    const entry = document.createElement("div");
-    entry.className = "dealynx-timeline-item";
-    entry.innerHTML = `
-      <div>${message}</div>
-      <span class="dealynx-pill ${isWarning ? "dealynx-pill-warning" : ""}">${new Date()
-        .toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-    `;
-    removeTimelinePlaceholder();
-    ui.captureTimeline.prepend(entry);
+    // Timeline removed in new UI design - keeping function for compatibility
+    console.log(`[DeaLynx] ${message}`);
   }
 
   function addTimelineCapture(capture) {
-    const entry = document.createElement("div");
-    entry.className = "dealynx-timeline-item";
-    entry.innerHTML = `
-      <div>
-        <strong>${sanitizeText(capture.primaryHeading || capture.title)}</strong>
-        <div style="font-size:11px;color:#475569;">${new URL(capture.url).hostname}</div>
-      </div>
-      <span class="dealynx-pill">${timestampLabel(capture.capturedAt)}</span>
-    `;
-    removeTimelinePlaceholder();
-    ui.captureTimeline.prepend(entry);
+    // Timeline removed in new UI design - keeping function for compatibility
+    console.log(`[DeaLynx] Captured: ${capture.primaryHeading || capture.title}`);
   }
 
   function removeTimelinePlaceholder() {
-    const placeholder = ui.captureTimeline.querySelector(".dealynx-empty-state");
-    if (placeholder) {
-      placeholder.remove();
-    }
+    // Timeline removed in new UI design - keeping function for compatibility
   }
 
   function timestampLabel(date) {
@@ -782,10 +883,12 @@
 
   function onChatInputChange() {
     const value = ui.chatInput.value.trim();
-    ui.chatSend.disabled = !value;
+    const hasSession = Boolean(state.backend.sessionId);
+    const disabled = !value || !hasSession || state.loadingFlags.fetchingReport;
+    ui.chatSend.disabled = disabled;
   }
 
-  function sendChatMessage() {
+  async function sendChatMessage() {
     const message = ui.chatInput.value.trim();
     if (!message) return;
     ui.chatInput.value = "";
@@ -794,9 +897,29 @@
     state.chatHistory.push({ sender: "user", text: message });
     renderChat();
 
-    const response = generateAgentResponse(message);
-    state.chatHistory.push({ sender: "agent", text: response });
+    const pendingReply = { sender: "agent", text: "", loading: true };
+    state.chatHistory.push(pendingReply);
     renderChat();
+
+    try {
+      const { text, offline } = await requestChatCompletion(state.backend.sessionId, message);
+      pendingReply.text = text;
+      pendingReply.loading = false;
+      if (offline) {
+        state.backend.status = "offline";
+        state.backend.error =
+          state.backend.error || new Error("Backend unreachable while requesting chat response.");
+      } else {
+        state.backend.status = "ready";
+      }
+    } catch (error) {
+      pendingReply.text = generateAgentResponse(message);
+      pendingReply.loading = false;
+      state.backend.status = "offline";
+      state.backend.error = error;
+    }
+    renderChat();
+    onChatInputChange();
   }
 
   function generateAgentResponse(message) {
@@ -823,123 +946,333 @@
 
   function renderAll() {
     renderSessionControls();
-    renderProfileOverview();
-    renderLists();
-    renderHighlights();
+    renderConnectionIndicator();
+    renderInsights();
     renderChat();
   }
 
-  function renderSessionControls() {
-    ui.startButton.disabled = state.sessionActive;
-    ui.captureButton.disabled = !state.sessionActive;
-    ui.endButton.disabled = !state.sessionActive;
+  function renderInsights() {
+    if (!ui.insightsContainer) return;
 
-    const statusLabel = state.sessionActive
-      ? `Active • ${state.captures.length} capture${state.captures.length === 1 ? "" : "s"}`
-      : "Idle";
-    ui.sessionStatus.textContent = statusLabel;
-
-    if (!state.captures.length) {
-      ui.captureTimeline.innerHTML =
-        '<div class="dealynx-empty-state">No captures yet. Start a session to collect prospect context.</div>';
-    }
-
-    const duration = state.sessionActive && state.sessionStartedAt
-      ? Math.round((Date.now() - state.sessionStartedAt) / 60000)
-      : state.sessionStartedAt
-        ? Math.round((Date.now() - state.sessionStartedAt) / 60000)
-        : 0;
-    ui.sessionDuration.textContent = `${duration}m`;
-
-    const lastCapture = state.captures[state.captures.length - 1];
-    ui.sessionLastCapture.textContent = lastCapture ? formatRelativeTime(lastCapture.capturedAt) : "Never";
-  }
-
-  function renderProfileOverview() {
-    const { profile, metrics } = state.report;
-    ui.profileName.textContent = profile.name;
-    ui.profileRole.textContent = profile.role;
-    ui.profileCompany.textContent = profile.company;
-    ui.profileLocation.textContent = profile.location;
-    ui.profileSummary.textContent = profile.summary;
-    ui.profileSummary.classList.toggle("dealynx-empty-state", false);
-    ui.engagementScore.textContent = `Score: ${metrics.engagementScore}`;
-  }
-
-  function renderLists() {
-    populateList(ui.backgroundList, state.report.background);
-    populateList(ui.engagementList, state.report.engagements);
-    populateList(ui.motivationList, state.report.motivations);
-    populateList(ui.communicationList, state.report.communication);
-    populateList(ui.outreachList, state.report.outreach);
-    populateList(ui.takeawayList, state.report.takeaways);
-    renderHooks(state.report.hooks);
-  }
-
-  function populateList(container, items) {
-    if (!items.length) {
-      container.innerHTML = '<li class="dealynx-empty-state">More data needed to populate this section.</li>';
-      return;
-    }
-    container.innerHTML = "";
-    items.forEach((item) => {
-      const li = document.createElement("li");
-      li.textContent = item;
-      container.appendChild(li);
-    });
-  }
-
-  function renderHooks(hooks) {
-    ui.hooksRow.innerHTML = "";
-    if (!hooks.length) {
-      const placeholder = document.createElement("div");
-      placeholder.className = "dealynx-empty-state";
-      placeholder.textContent = "Conversation hooks will populate as soon as relevant snippets are captured.";
-      ui.hooksRow.appendChild(placeholder);
-      return;
-    }
-    hooks.forEach((hook) => {
-      const badge = document.createElement("div");
-      badge.className = "dealynx-badge";
-      badge.textContent = hook.length > 30 ? `${hook.slice(0, 28)}…` : hook;
-      ui.hooksRow.appendChild(badge);
-    });
-  }
-
-  function renderHighlights() {
-    ui.highlightCards.innerHTML = "";
-    if (!state.report.highlights.length) {
-      const placeholder = document.createElement("div");
-      placeholder.className = "dealynx-empty-state";
-      placeholder.textContent = "We’ll surface notable snippets once captures are analysed.";
-      ui.highlightCards.appendChild(placeholder);
-      return;
-    }
-    state.report.highlights.forEach((card) => {
-      const element = document.createElement("div");
-      element.className = "dealynx-section";
-      element.style.padding = "12px 14px";
-      element.style.marginBottom = "0";
-      element.innerHTML = `
-        <div style="font-size:12px;color:#475569;margin-bottom:6px;">${formatRelativeTime(card.timestamp)}</div>
-        <div style="font-size:13px;color:#0f172a;line-height:1.5;">${card.text}</div>
-        <div style="font-size:11px;color:#64748b;margin-top:8px;">Source: ${new URL(card.url).hostname}</div>
+    if (!state.reportReady || state.insights.length === 0) {
+      ui.insightsContainer.innerHTML = `
+        <div class="dealynx-empty-insights">
+          <div class="dealynx-empty-insights-icon">📊</div>
+          <div class="dealynx-empty-insights-text">No insights yet.</div>
+          <button class="dealynx-button dealynx-button-primary dealynx-button-start-analysis" data-action="start-analysis">Start Analysis</button>
+        </div>
       `;
-      ui.highlightCards.appendChild(element);
+      return;
+    }
+
+    // Render insight cards
+    ui.insightsContainer.innerHTML = state.insights.map(insight => `
+      <div class="dealynx-insight-card">
+        <div class="dealynx-insight-title">${escapeHtml(insight.title)}</div>
+        <div class="dealynx-insight-summary">${escapeHtml(insight.summary)}</div>
+      </div>
+    `).join('');
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function renderSessionControls() {
+    // Update button states
+    const startButtons = ui.sidebar.querySelectorAll('[data-action="start-session"], [data-action="start-analysis"]');
+    const captureButton = ui.sidebar.querySelector('[data-action="capture-view"]');
+    const endButton = ui.sidebar.querySelector('[data-action="end-session"]');
+
+    startButtons.forEach(button => {
+      button.disabled = state.sessionActive || state.loadingFlags.connecting;
     });
+
+    if (captureButton) {
+      captureButton.disabled = !state.sessionActive || state.loadingFlags.capturing;
+    }
+
+    if (endButton) {
+      endButton.disabled = !state.sessionActive || !state.captures.length || state.loadingFlags.fetchingReport;
+    }
+
+    let statusLabel = "Ready";
+    if (state.loadingFlags.connecting) {
+      statusLabel = "Connecting…";
+    } else if (state.loadingFlags.capturing) {
+      statusLabel = "Capturing…";
+    } else if (state.loadingFlags.fetchingReport) {
+      statusLabel = "Analyzing…";
+    } else if (state.sessionActive) {
+      statusLabel = `Active • ${state.captures.length} capture${state.captures.length === 1 ? "" : "s"}`;
+    } else if (state.reportReady) {
+      statusLabel = "Complete";
+    }
+
+    if (ui.sessionStatus) {
+      ui.sessionStatus.textContent = statusLabel;
+    }
+  }
+
+  function renderConnectionIndicator() {
+    if (!ui.connectionStatus) return;
+    let status = state.backend.status || "idle";
+    if (state.loadingFlags.connecting) {
+      status = "connecting";
+    }
+    const statusMap = {
+      idle: { label: "Ready", title: "Ready to begin analysis" },
+      connecting: { label: "Connecting", title: "Connecting to AI service" },
+      ready: { label: "Connected", title: "Connected to AI service" },
+      offline: {
+        label: "Offline",
+        title: state.backend.error ? `Error: ${state.backend.error.message}` : "Service unavailable"
+      }
+    };
+    const config = statusMap[status] || statusMap.idle;
+    ui.connectionStatus.dataset.status = status;
+    if (ui.connectionLabel) {
+      ui.connectionLabel.textContent = config.label;
+    }
+    ui.connectionStatus.setAttribute("title", config.title);
   }
 
   function renderChat() {
     ui.chatHistory.innerHTML = "";
     state.chatHistory.slice(-14).forEach((message) => {
       const bubble = document.createElement("div");
-      bubble.className = `dealynx-chat-bubble dealynx-${message.sender}`;
-      bubble.textContent = message.text;
+      const loadingClass = message.loading ? " dealynx-loading" : "";
+      bubble.className = `dealynx-chat-bubble dealynx-${message.sender}${loadingClass}`;
+      if (message.loading) {
+        bubble.innerHTML = '<span class="dealynx-typing"><span></span><span></span><span></span></span>';
+      } else {
+        bubble.textContent = message.text;
+      }
       ui.chatHistory.appendChild(bubble);
     });
     ui.chatHistory.scrollTop = ui.chatHistory.scrollHeight;
   }
 
+  function createEmptyReport() {
+    return {
+      profile: {
+        name: "Awaiting insight",
+        role: "—",
+        company: "—",
+        summary: "Start a session and capture a few pages to generate the AI report.",
+        location: "—"
+      },
+      background: [],
+      engagements: [],
+      motivations: [],
+      communication: [],
+      outreach: [],
+      takeaways: [],
+      hooks: [],
+      highlights: [],
+      keywords: [],
+      metrics: {
+        engagementScore: 0,
+        sentiment: "Neutral",
+        freshness: "No data"
+      }
+    };
+  }
+
+  async function createBackendSession() {
+    return performApiCall(
+      "/sessions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          client: "dealynx-chrome",
+          started_at: new Date().toISOString()
+        })
+      },
+      () => ({ session_id: `stub-${Date.now()}` })
+    );
+  }
+
+  async function sendCaptureToBackend(sessionId, capture) {
+    if (!sessionId) return;
+    const payload = sanitizeCaptureForBackend(capture);
+    const endpoint = `/sessions/${encodeURIComponent(sessionId)}/captures`;
+    return performApiCall(
+      endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      },
+      () => ({ accepted: true })
+    );
+  }
+
+  async function fetchBackendReport(sessionId, captures) {
+    if (!sessionId) {
+      return generateReportFromCaptures(captures);
+    }
+    const endpoint = `/sessions/${encodeURIComponent(sessionId)}/report`;
+    const response = await performApiCall(
+      endpoint,
+      { method: "GET" },
+      () => generateReportFromCaptures(captures)
+    );
+    return response?.report || response;
+  }
+
+  async function requestChatCompletion(sessionId, prompt) {
+    if (!sessionId) {
+      return { text: generateAgentResponse(prompt), offline: true };
+    }
+    const endpoint = `/sessions/${encodeURIComponent(sessionId)}/chat`;
+    const response = await performApiCall(
+      endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: prompt })
+      },
+      () => ({ reply: generateAgentResponse(prompt) })
+    );
+    const offline = response && typeof response === "object" && response.__offline;
+    if (response && typeof response === "object") {
+      delete response.__offline;
+    }
+    const text =
+      typeof response === "string"
+        ? response
+        : response?.reply || response?.message || generateAgentResponse(prompt);
+    return { text, offline };
+  }
+
+  async function performApiCall(path, options, fallback) {
+    const finalOptions = {
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...(options?.headers || {})
+      }
+    };
+    if (options?.body && !finalOptions.headers["Content-Type"]) {
+      finalOptions.headers["Content-Type"] = "application/json";
+    }
+    const controller = new AbortController();
+    finalOptions.signal = controller.signal;
+    const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}${path}`, finalOptions);
+      clearTimeout(timeout);
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(errorText || `Request failed with status ${response.status}`);
+      }
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        return await response.json();
+      }
+      return null;
+    } catch (error) {
+      clearTimeout(timeout);
+      console.warn(`DeaLynx: falling back for ${path}`, error);
+      if (fallback) {
+        const fallbackResult = await fallback(error);
+        if (fallbackResult && typeof fallbackResult === "object" && !Array.isArray(fallbackResult)) {
+          fallbackResult.__offline = true;
+        }
+        return fallbackResult;
+      }
+      throw error;
+    }
+  }
+
+  function sanitizeCaptureForBackend(capture) {
+    return {
+      capture_id: capture.id,
+      captured_at: new Date(capture.capturedAt).toISOString(),
+      url: capture.url,
+      title: capture.title,
+      description: capture.description,
+      primary_heading: capture.primaryHeading,
+      secondary_heading: capture.secondaryHeading,
+      keywords: capture.keywords,
+      highlights: capture.highlights,
+      sentiment: capture.sentiment,
+      raw_text: capture.rawText
+    };
+  }
+
+  function normaliseReportPayload(raw) {
+    const base = createEmptyReport();
+    if (!raw) {
+      return base;
+    }
+
+    if (raw.profile && typeof raw.profile === "object") {
+      base.profile = { ...base.profile, ...raw.profile };
+    }
+    REPORT_SECTIONS.forEach((section) => {
+      const value = raw[section];
+      if (Array.isArray(value)) {
+        base[section] = value;
+      }
+    });
+    if (Array.isArray(raw.keywords)) {
+      base.keywords = raw.keywords;
+    }
+    if (raw.metrics && typeof raw.metrics === "object") {
+      base.metrics = { ...base.metrics, ...raw.metrics };
+    }
+    base.highlights = normaliseHighlights(raw.highlights || base.highlights);
+    return base;
+  }
+
+  function normaliseHighlights(items) {
+    if (!Array.isArray(items)) return [];
+    return items
+      .map((item) => {
+        if (typeof item === "string") {
+          return {
+            text: item,
+            url: null,
+            timestamp: Date.now()
+          };
+        }
+        if (item && typeof item === "object") {
+          const timestamp = item.timestamp || item.captured_at || Date.now();
+          return {
+            text: item.text || item.summary || "",
+            url: item.url || item.source_url || null,
+            timestamp: typeof timestamp === "string" ? new Date(timestamp).getTime() : timestamp
+          };
+        }
+        return null;
+      })
+      .filter(Boolean);
+  }
+
+  let captureOverlayTimer = null;
+
+  function triggerCaptureOverlay() {
+    if (!ui.captureOverlay) return;
+    ui.captureOverlay.classList.add("dealynx-visible");
+    if (captureOverlayTimer) {
+      clearTimeout(captureOverlayTimer);
+    }
+    captureOverlayTimer = setTimeout(() => {
+      ui.captureOverlay.classList.remove("dealynx-visible");
+    }, 900);
+  }
+
+  console.log('[DeaLynx] Initializing extension...');
   createSidebar();
+  console.log('[DeaLynx] Sidebar created');
   setOpenState(true);
+  console.log('[DeaLynx] Extension ready');
 })();
