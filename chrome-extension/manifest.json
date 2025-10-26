@@ -31,7 +31,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["logo.png"],
+      "resources": ["logo.png", ".env"],
       "matches": ["<all_urls>"]
     }
   ]

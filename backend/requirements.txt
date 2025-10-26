@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+google-adk==1.10.0
+python-dotenv
+pydantic
+google-generativeai

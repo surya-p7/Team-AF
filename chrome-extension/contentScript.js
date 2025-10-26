@@ -65,18 +65,16 @@
     "therefore"
   ]);
 
-  const API_BASE_URL = "http://localhost:8000/api";
+  let API_BASE_URL = "http://localhost:8000/api";
+  let WS_BASE_URL = "ws://localhost:8000/ws";
   const API_TIMEOUT_MS = 12000;
-  const REPORT_SECTIONS = [
-    "background",
-    "engagements",
-    "motivations",
-    "communication",
-    "outreach",
-    "takeaways",
-    "hooks",
-    "highlights"
-  ];
+
+  chrome.runtime.sendMessage({ type: "GET_BACKEND_URL" }, (response) => {
+    if (response && response.backendUrl) {
+      API_BASE_URL = `${response.backendUrl}/api`;
+      WS_BASE_URL = `${response.backendUrl.replace('http', 'ws')}/ws`;
+    }
+  });
 
   const state = {
     open: true,
@@ -86,6 +84,8 @@
     captures: [],
     report: createEmptyReport(),
     reportReady: false,
+    analysisError: null,
+    productDescription: localStorage.getItem('dealynx-product-description') || "",
     loadingFlags: {
       connecting: false,
       capturing: false,
@@ -96,13 +96,13 @@
       status: "idle",
       error: null
     },
+    chatSocket: null,
     chatHistory: [
       {
         sender: "agent",
         text: "Welcome! Begin a session, capture relevant pages, and I'll generate insights for you."
       }
-    ],
-    insights: []
+    ]
   };
 
   let ui = {};
@@ -135,6 +135,17 @@
           <span class="dealynx-pill" data-field="session-status">Ready</span>
         </div>
 
+        <div class="dealynx-product-intake">
+          <label class="dealynx-product-label" for="dealynx-product-description">Product description</label>
+          <textarea
+            id="dealynx-product-description"
+            class="dealynx-product-textarea"
+            data-field="product-description"
+            placeholder="Describe your product, value proposition, and ideal customer outcomes. DeaLynx uses this to judge prospect fit."
+          ></textarea>
+          <p class="dealynx-product-hint">Tip: Mention differentiators, target buyers, and key pain points your solution solves.</p>
+        </div>
+
         <div class="dealynx-session-controls">
           <button class="dealynx-button dealynx-button-primary" data-action="start-session">Begin</button>
           <button class="dealynx-button dealynx-button-outline" data-action="capture-view" disabled>Capture</button>
@@ -144,9 +155,10 @@
         <div class="dealynx-body" id="dealynx-scrollable-insights">
           <div class="dealynx-insights-container" data-field="insights-container">
             <div class="dealynx-empty-insights">
-              <div class="dealynx-empty-insights-icon">📊</div>
-              <div class="dealynx-empty-insights-text">No insights yet.</div>
-              <button class="dealynx-button dealynx-button-primary dealynx-button-start-analysis" data-action="start-analysis">Start Analysis</button>
+              <div class="dealynx-empty-insights-icon">👆</div>
+              <div class="dealynx-empty-insights-text">
+                Begin a session, capture prospect pages, then click Finish to generate an AI report.
+              </div>
             </div>
           </div>
         </div>
@@ -205,7 +217,8 @@
       insightsContainer: sidebar.querySelector('[data-field="insights-container"]'),
       chatHistory: sidebar.querySelector('[data-field="chat-history"]'),
       chatInput: sidebar.querySelector('[data-field="chat-input"]'),
-      chatSend: sidebar.querySelector('[data-action="send-chat"]')
+      chatSend: sidebar.querySelector('[data-action="send-chat"]'),
+      productDescriptionInput: sidebar.querySelector('[data-field="product-description"]')
     };
 
     setupEventListeners();
@@ -220,28 +233,21 @@
       if (!target) return;
 
       const action = target.getAttribute("data-action");
-      console.log(`[DeaLynx] Button clicked: ${action}`);
 
       switch (action) {
         case "start-session":
-        case "start-analysis":
-          console.log('[DeaLynx] Starting session...');
           startSession();
           break;
         case "capture-view":
-          console.log('[DeaLynx] Capturing view...');
           captureCurrentView();
           break;
         case "end-session":
-          console.log('[DeaLynx] Ending session...');
           endSession();
           break;
         case "collapse":
-          console.log('[DeaLynx] Closing sidebar...');
           setOpenState(false);
           break;
         case "send-chat":
-          console.log('[DeaLynx] Sending chat message...');
           sendChatMessage();
           break;
       }
@@ -258,6 +264,9 @@
       }
     });
     ui.scrollContainer.addEventListener("scroll", updateScrollShadows);
+    if (ui.productDescriptionInput) {
+      ui.productDescriptionInput.addEventListener("input", onProductDescriptionChange);
+    }
 
     chrome.runtime.onMessage.addListener((message) => {
       if (message?.type === "DEALYNX_TOGGLE") {
@@ -280,6 +289,80 @@
     // Update tab content
     ui.insightsContent.classList.toggle("dealynx-tab-content-active", tabName === "insights");
     ui.chatContent.classList.toggle("dealynx-tab-content-active", tabName === "chat");
+
+    if (tabName === 'chat' && !state.chatSocket && state.backend.sessionId) {
+      connectChatSocket();
+    }
+  }
+
+  function connectChatSocket() {
+    if (state.chatSocket || !state.backend.sessionId) {
+      return;
+    }
+
+    const url = `${WS_BASE_URL}/sessions/${state.backend.sessionId}/chat`;
+    state.chatSocket = new WebSocket(url);
+
+    state.chatSocket.onopen = () => {
+      state.backend.status = 'ready';
+      renderAll();
+    };
+
+    state.chatSocket.onmessage = handleSocketMessage;
+
+    state.chatSocket.onclose = () => {
+      state.chatSocket = null;
+      state.backend.status = 'offline';
+      renderAll();
+      // Attempt to reconnect after a delay
+      setTimeout(() => {
+        if (state.sessionActive) {
+          connectChatSocket();
+        }
+      }, 5000);
+    };
+
+    state.chatSocket.onerror = (error) => {
+      console.error('[DeaLynx] Chat socket error:', error);
+      state.backend.error = new Error('Chat connection failed.');
+      state.backend.status = 'offline';
+      state.chatSocket = null;
+      renderAll();
+    };
+  }
+
+  function handleSocketMessage(event) {
+    const message = JSON.parse(event.data);
+
+    if (message.error) {
+      console.error('[DeaLynx] Received error from WebSocket:', message.error);
+      state.backend.error = new Error(message.error);
+      state.backend.status = 'offline';
+      ui.chatInput.disabled = false;
+      renderAll();
+      return;
+    }
+
+    if (message.turn_complete || message.interrupted) {
+      const lastMessage = state.chatHistory[state.chatHistory.length - 1];
+      if (lastMessage && lastMessage.sender === 'agent' && lastMessage.loading) {
+        lastMessage.loading = false;
+      }
+      ui.chatInput.disabled = false;
+      renderChat();
+      onChatInputChange()
+      return;
+    }
+
+    if (message.mime_type === 'text/plain') {
+      const lastMessage = state.chatHistory[state.chatHistory.length - 1];
+      if (lastMessage && lastMessage.sender === 'agent' && lastMessage.loading) {
+        lastMessage.text = message.data;
+      } else {
+        state.chatHistory.push({ sender: 'agent', text: message.data, loading: true });
+      }
+      renderChat();
+    }
   }
 
   function observeScroll() {
@@ -315,19 +398,23 @@
   }
 
   async function startSession() {
-    console.log('[DeaLynx] startSession() called');
     if (state.loadingFlags.connecting) {
-      console.log('[DeaLynx] Already connecting, skipping...');
+      return;
+    }
+    if (!state.productDescription.trim()) {
+      addTimelineMessage("Add a product description to tailor DeaLynx analysis before starting.", true);
+      if (ui.productDescriptionInput) {
+        ui.productDescriptionInput.focus();
+      }
       return;
     }
 
-    console.log('[DeaLynx] Initializing session...');
     state.sessionActive = true;
     state.sessionStartedAt = Date.now();
     state.captures = [];
     state.report = createEmptyReport();
     state.reportReady = false;
-    state.insights = [];
+    state.analysisError = null;
     state.loadingFlags.connecting = true;
     state.loadingFlags.fetchingReport = false;
     state.loadingFlags.capturing = false;
@@ -338,7 +425,6 @@
     };
     addTimelineMessage("Session started. Navigate through the prospect's footprint and capture relevant views.");
     renderAll();
-    console.log('[DeaLynx] Session initialized, connecting to backend...');
 
     try {
       const response = await createBackendSession();
@@ -354,6 +440,7 @@
         addTimelineMessage("Backend unreachable. Operating in offline insight mode until connection is restored.", true);
       } else {
         addTimelineMessage("Connected to DeaLynx services. Captures will sync automatically.");
+        connectChatSocket(); // Automatically connect to chat
       }
     } catch (error) {
       state.backend.sessionId = state.backend.sessionId || `stub-${Date.now()}`;
@@ -363,121 +450,51 @@
     } finally {
       state.loadingFlags.connecting = false;
       renderAll();
+      if (state.activeTab === 'chat') {
+        connectChatSocket();
+      }
     }
   }
 
   async function endSession() {
     if (!state.sessionActive || state.loadingFlags.fetchingReport) return;
-    state.sessionActive = false;
+    
     const totalCaptures = state.captures.length;
-
     if (!totalCaptures) {
-      state.report = createEmptyReport();
-      state.reportReady = true;
-      state.insights = [];
+      state.analysisError = "Capture at least one relevant page before finishing.";
       renderAll();
       return;
     }
 
     state.loadingFlags.fetchingReport = true;
     state.reportReady = false;
+    state.analysisError = null;
+    addTimelineMessage("Analyzing captured views with DeaLynx agent…");
     renderAll();
 
     try {
-      const backendReport = await fetchBackendReport(state.backend.sessionId, state.captures);
-      const offline = backendReport && typeof backendReport === "object" && backendReport.__offline;
-      if (offline) {
-        delete backendReport.__offline;
-        state.backend.status = "offline";
-        state.backend.error =
-          state.backend.error || new Error("Backend unreachable while requesting report.");
-        state.report = normaliseReportPayload(backendReport);
-      } else {
-        state.backend.status = "ready";
-        state.report = normaliseReportPayload(backendReport);
-      }
+      // Single call to the backend to analyze and get the report
+      const backendReport = await performApiCall(`/sessions/${state.backend.sessionId}/analyze`, {
+        method: 'POST',
+        body: JSON.stringify(state.captures),
+      });
+      
+      state.report = normaliseReportPayload(backendReport.report);
       state.reportReady = true;
-      generateInsightsFromReport();
+      addTimelineMessage("Fresh insights are ready. Review the AI report for outreach angles.");
+
     } catch (error) {
       state.backend.error = error;
       state.backend.status = "offline";
-      state.report = normaliseReportPayload(generateReportFromCaptures(state.captures));
-      state.reportReady = true;
-      generateInsightsFromReport();
+      state.report = createEmptyReport();
+      state.reportReady = false;
+      state.analysisError = "Could not reach the DeaLynx agent. Please try again in a moment.";
+      addTimelineMessage("Analysis failed. Unable to reach the DeaLynx agent.", true);
     } finally {
       state.loadingFlags.fetchingReport = false;
+      state.sessionActive = false; // End session regardless of outcome
       renderAll();
     }
-  }
-
-  function generateInsightsFromReport() {
-    const insights = [];
-
-    // Profile Overview
-    if (state.report.profile && state.report.profile.name) {
-      insights.push({
-        title: "Profile Overview",
-        summary: `${state.report.profile.name || 'Prospect'} - ${state.report.profile.role || ''} at ${state.report.profile.company || ''}. ${state.report.profile.summary || ''}`
-      });
-    }
-
-    // Professional Background
-    if (state.report.background && state.report.background.length > 0) {
-      insights.push({
-        title: "Professional Background",
-        summary: state.report.background.slice(0, 3).join(' ')
-      });
-    }
-
-    // Engagement Insights
-    if (state.report.engagements && state.report.engagements.length > 0) {
-      insights.push({
-        title: "Engagement Insights",
-        summary: state.report.engagements.slice(0, 3).join(' ')
-      });
-    }
-
-    // Motivations
-    if (state.report.motivations && state.report.motivations.length > 0) {
-      insights.push({
-        title: "Interests & Motivations",
-        summary: state.report.motivations.slice(0, 3).join(' ')
-      });
-    }
-
-    // Communication Style
-    if (state.report.communication && state.report.communication.length > 0) {
-      insights.push({
-        title: "Communication Style",
-        summary: state.report.communication.slice(0, 3).join(' ')
-      });
-    }
-
-    // Outreach Suggestions
-    if (state.report.outreach && state.report.outreach.length > 0) {
-      insights.push({
-        title: "Outreach Suggestions",
-        summary: state.report.outreach.slice(0, 3).join(' ')
-      });
-    }
-
-    // Key Takeaways
-    if (state.report.takeaways && state.report.takeaways.length > 0) {
-      insights.push({
-        title: "Key Takeaways",
-        summary: state.report.takeaways.slice(0, 3).join(' ')
-      });
-    }
-
-    // Highlights
-    if (state.report.highlights && state.report.highlights.length > 0) {
-      insights.push({
-        title: "Recent Highlights",
-        summary: state.report.highlights.map(h => h.text || '').join(' ')
-      });
-    }
-
-    state.insights = insights;
   }
 
   async function captureCurrentView() {
@@ -496,26 +513,10 @@
     addTimelineCapture(capture);
     renderAll();
 
-    try {
-      const response = await sendCaptureToBackend(state.backend.sessionId, capture);
-      if (response && typeof response === "object") {
-        const offline = response.__offline;
-        delete response.__offline;
-        if (offline) {
-          state.backend.status = "offline";
-          state.backend.error =
-            state.backend.error || new Error("Backend unreachable during capture upload.");
-          addTimelineMessage("Capture stored locally. Backend will process once connectivity resumes.", true);
-        }
-      }
-    } catch (error) {
-      state.backend.error = error;
-      state.backend.status = "offline";
-      addTimelineMessage("Capture stored locally. Will retry upload when backend is reachable.", true);
-    } finally {
-      state.loadingFlags.capturing = false;
-      renderAll();
-    }
+    // No longer sending individual captures to the backend.
+    // They will be sent in bulk during the analysis phase.
+    state.loadingFlags.capturing = false;
+    renderAll();
   }
 
   function buildCaptureSnapshot() {
@@ -536,6 +537,7 @@
     const keywordEntries = extractKeywords(fullText, 10);
     const keywords = keywordEntries.map((entry) => entry.word);
     const highlights = extractHighlights(fullText, keywords.slice(0, 6), 3);
+    const domSnapshot = getDomSnapshot(60000);
 
     return {
       id: `capture-${capturedAt.getTime()}`,
@@ -549,6 +551,7 @@
       keywords,
       highlights,
       rawText: fullText,
+      domSnapshot,
       sentiment: inferSentiment(fullText)
     };
   }
@@ -562,6 +565,19 @@
     const textContent = document.body?.innerText || "";
     const normalised = textContent.replace(/\s+/g, " ").trim();
     return normalised.slice(0, limit);
+  }
+
+  function getDomSnapshot(limit = 60000) {
+    try {
+      const root = document.documentElement.cloneNode(true);
+      const removable = root.querySelectorAll("script, style, noscript, iframe");
+      removable.forEach((node) => node.remove());
+      const html = root.outerHTML || "";
+      return html.replace(/\s+/g, " ").trim().slice(0, limit);
+    } catch (error) {
+      console.warn("DeaLynx: unable to capture DOM snapshot", error);
+      return "";
+    }
   }
 
   function extractKeywords(text, limit = 8) {
@@ -667,11 +683,11 @@
   }
 
   function generateReportFromCaptures(captures) {
+    const report = createEmptyReport();
     const localCaptures = captures || [];
     if (!localCaptures.length) {
-      const placeholder = createEmptyReport();
-      placeholder.profile.summary = "No captures were recorded during this session.";
-      return placeholder;
+      report.summary = "No captures were recorded during this session.";
+      return report;
     }
 
     const firstCapture = localCaptures[0];
@@ -699,44 +715,74 @@
     const locationCandidate = detectLocationFromText(firstCapture.description || firstCapture.rawText);
 
     const summary = buildSummarySnippet(latestCapture);
+    const fitScore = Math.min(100, sortedKeywords.length * 8 + localCaptures.length * 15 + optimisticMentions * 8);
+    const engagementScore = Math.min(100, sortedKeywords.length * 6 + localCaptures.length * 12);
+    const sentimentLabel = latestCapture.sentiment || "Neutral";
 
-    const background = buildBackgroundInsights(sortedKeywords);
-    const engagements = buildEngagementInsights(sortedKeywords);
-    const motivations = buildMotivationInsights(sortedKeywords);
-    const communication = buildCommunicationInsights(latestCapture);
-    const outreach = buildOutreachIdeas(sortedKeywords);
-    const takeaways = buildTakeaways(sortedKeywords, localCaptures.length);
-    const hooks = buildConversationHooks(sortedKeywords, latestCapture);
-    const highlights = buildHighlightCards(localCaptures);
-
-    const engagementScore = Math.min(
-      100,
-      sortedKeywords.length * 8 + localCaptures.length * 12 + optimisticMentions * 6
-    );
-
-    return {
-      profile: {
-        name: nameCandidate || firstCapture.primaryHeading || "Prospect profile",
-        role: roleCandidate || "Role detected from captured pages",
-        company: companyCandidate || "Company will be refined after backend call",
-        summary,
-        location: locationCandidate || "—"
-      },
-      background,
-      engagements,
-      motivations,
-      communication,
-      outreach,
-      takeaways,
-      hooks,
-      highlights,
-      keywords: sortedKeywords.slice(0, 8),
-      metrics: {
-        engagementScore,
-        sentiment: latestCapture.sentiment,
-        freshness: formatRelativeTime(latestCapture.capturedAt)
-      }
+    report.profile = {
+      name: nameCandidate || firstCapture.primaryHeading || "Prospect profile",
+      role: roleCandidate || "Role inferred from captured pages",
+      company: companyCandidate || "Company to be confirmed",
+      summary,
+      location: locationCandidate || "—"
     };
+    report.summary = summary;
+    report.keywords = sortedKeywords.slice(0, 10).map(capitalize);
+    report.metrics = {
+      fitScore,
+      engagementScore,
+      sentiment: sentimentLabel,
+      freshness: formatRelativeTime(latestCapture.capturedAt)
+    };
+    report.kpis = [
+      {
+        label: "Solution Fit",
+        value: fitScore,
+        unit: "/100",
+        description: `Derived from ${localCaptures.length} capture${localCaptures.length === 1 ? "" : "s"} and topical alignment.`
+      },
+      {
+        label: "Engagement Signals",
+        value: engagementScore,
+        unit: "/100",
+        description: "Strength of recent activity and repeated focus areas across captured pages."
+      }
+    ];
+    report.sections = [
+      { title: "Professional Background", items: buildBackgroundInsights(sortedKeywords) },
+      { title: "Engagement Signals", items: buildEngagementInsights(sortedKeywords) },
+      { title: "Motivations & Interests", items: buildMotivationInsights(sortedKeywords) },
+      { title: "Communication Style", items: buildCommunicationInsights(latestCapture) },
+      { title: "Outreach Suggestions", items: buildOutreachIdeas(sortedKeywords) },
+      { title: "Key Takeaways", items: buildTakeaways(sortedKeywords, localCaptures.length) },
+      { title: "Conversation Hooks", items: buildConversationHooks(sortedKeywords, latestCapture) }
+    ]
+      .map((section) => ({
+        title: section.title,
+        items: Array.isArray(section.items) ? section.items.filter(Boolean) : []
+      }))
+      .filter((section) => section.items.length);
+    report.highlights = buildHighlightCards(localCaptures);
+    report.charts = {
+      interestBreakdown: sortedKeywords.slice(0, 6).map((keyword, index) => ({
+        label: capitalize(keyword),
+        value: keywordFrequency.get(keyword) || Math.max(1, 6 - index)
+      })),
+      sentimentSignals: [
+        { label: "Optimistic cues", value: optimisticMentions },
+        { label: "Captured pages", value: localCaptures.length }
+      ]
+    };
+    report.verdict = {
+      fitVerdict: fitScore >= 70 ? "High Potential" : fitScore >= 45 ? "Moderate Potential" : "Low Potential",
+      confidence: localCaptures.length >= 3 ? "High" : localCaptures.length === 2 ? "Medium" : "Low",
+      rationale: [
+        `${sortedKeywords.length} unique focus areas identified across captures.`,
+        `Tone trends ${sentimentLabel.toLowerCase()} with ${optimisticMentions} optimistic cue${optimisticMentions === 1 ? "" : "s"}.`
+      ]
+    };
+
+    return report;
   }
 
   function buildSummarySnippet(capture) {
@@ -835,11 +881,11 @@
         cards.push({
           text: highlight,
           url: capture.url,
-          timestamp: capture.capturedAt
+          timestamp: new Date(capture.capturedAt).toISOString()
         });
       });
     });
-    return cards.slice(0, 3);
+    return cards.slice(0, 6);
   }
 
   function capitalize(value) {
@@ -883,16 +929,36 @@
 
   function onChatInputChange() {
     const value = ui.chatInput.value.trim();
-    const hasSession = Boolean(state.backend.sessionId);
-    const disabled = !value || !hasSession || state.loadingFlags.fetchingReport;
+    const disabled = !value || !state.chatSocket || state.chatSocket.readyState !== WebSocket.OPEN || ui.chatInput.disabled;
     ui.chatSend.disabled = disabled;
+  }
+
+  function onProductDescriptionChange(event) {
+    state.productDescription = event.target.value;
+    try {
+      localStorage.setItem("dealynx-product-description", state.productDescription);
+    } catch (error) {
+      console.warn("DeaLynx: unable to persist product description", error);
+    }
+    updateStartButtons();
+  }
+
+  function updateStartButtons() {
+    const startButtons = ui.sidebar.querySelectorAll('[data-action="start-session"]');
+    const disableStart =
+      state.sessionActive || state.loadingFlags.connecting || !state.productDescription.trim();
+    startButtons.forEach((button) => {
+      button.disabled = disableStart;
+    });
   }
 
   async function sendChatMessage() {
     const message = ui.chatInput.value.trim();
-    if (!message) return;
+    if (!message || !state.chatSocket || state.chatSocket.readyState !== WebSocket.OPEN) return;
+
     ui.chatInput.value = "";
     ui.chatSend.disabled = true;
+    ui.chatInput.disabled = true;
 
     state.chatHistory.push({ sender: "user", text: message });
     renderChat();
@@ -901,48 +967,11 @@
     state.chatHistory.push(pendingReply);
     renderChat();
 
-    try {
-      const { text, offline } = await requestChatCompletion(state.backend.sessionId, message);
-      pendingReply.text = text;
-      pendingReply.loading = false;
-      if (offline) {
-        state.backend.status = "offline";
-        state.backend.error =
-          state.backend.error || new Error("Backend unreachable while requesting chat response.");
-      } else {
-        state.backend.status = "ready";
-      }
-    } catch (error) {
-      pendingReply.text = generateAgentResponse(message);
-      pendingReply.loading = false;
-      state.backend.status = "offline";
-      state.backend.error = error;
-    }
-    renderChat();
+    state.chatSocket.send(JSON.stringify({ mime_type: "text/plain", data: message }));
     onChatInputChange();
   }
 
-  function generateAgentResponse(message) {
-    if (!state.captures.length) {
-      return "Capture at least one view and I’ll translate the page content into prospect-specific insights.";
-    }
-    const topKeywords = state.report.keywords.slice(0, 3);
-    const focusArea = topKeywords.length ? topKeywords.join(", ") : "the themes you captured";
-    const tone = state.report.metrics.sentiment.toLowerCase();
-    return [
-      `I’m reading "${focusArea}" as current focus areas. Frame your reply around their wins with a ${tone} tone.`,
-      "",
-      `Try asking something like: “${buildPromptSuggestion(message, topKeywords)}”`,
-      "",
-      "Once the backend agent comes online, I’ll surface fully personalised drafts."
-    ].join("\n");
-  }
 
-  function buildPromptSuggestion(message, keywords) {
-    const seed = keywords[0] || "recent projects";
-    const trimmed = message.replace(/[?.!]+$/, "");
-    return `${capitalize(trimmed)} while referencing your expertise in ${seed}?`;
-  }
 
   function renderAll() {
     renderSessionControls();
@@ -954,24 +983,292 @@
   function renderInsights() {
     if (!ui.insightsContainer) return;
 
-    if (!state.reportReady || state.insights.length === 0) {
+    if (state.loadingFlags.fetchingReport) {
+      ui.insightsContainer.innerHTML = renderInsightsSkeleton();
+      return;
+    }
+
+    if (state.analysisError) {
       ui.insightsContainer.innerHTML = `
-        <div class="dealynx-empty-insights">
-          <div class="dealynx-empty-insights-icon">📊</div>
-          <div class="dealynx-empty-insights-text">No insights yet.</div>
-          <button class="dealynx-button dealynx-button-primary dealynx-button-start-analysis" data-action="start-analysis">Start Analysis</button>
+        <div class="dealynx-report-card dealynx-report-error">
+          <div class="dealynx-report-title">Analysis unavailable</div>
+          <p class="dealynx-report-body">${escapeHtml(state.analysisError)}</p>
+          <button class="dealynx-button dealynx-button-primary" data-action="start-session">Retry Analysis</button>
         </div>
       `;
       return;
     }
 
-    // Render insight cards
-    ui.insightsContainer.innerHTML = state.insights.map(insight => `
-      <div class="dealynx-insight-card">
-        <div class="dealynx-insight-title">${escapeHtml(insight.title)}</div>
-        <div class="dealynx-insight-summary">${escapeHtml(insight.summary)}</div>
+    if (!state.reportReady) {
+      ui.insightsContainer.innerHTML = `
+        <div class="dealynx-empty-insights">
+          <div class="dealynx-empty-insights-icon">👆</div>
+          <div class="dealynx-empty-insights-text">
+            Capture relevant prospect pages and click Finish to generate an AI report.
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    const kpiDeck = renderKpiDeck(state.report);
+    const profileCard = renderProfileOverview(state.report);
+    const chartBlocks = renderChartBlocks(state.report);
+    const sectionCards = renderReportSections(state.report);
+    const highlightCard = renderHighlightsCard(state.report.highlights);
+
+    ui.insightsContainer.innerHTML = [kpiDeck, profileCard, chartBlocks, ...sectionCards, highlightCard]
+      .filter(Boolean)
+      .join("");
+  }
+
+  function renderInsightsSkeleton() {
+    const skeletonCard = () => `
+      <div class="dealynx-skeleton-card" aria-hidden="true">
+        <div class="dealynx-skeleton-line dealynx-skeleton-line-title"></div>
+        <div class="dealynx-skeleton-line"></div>
+        <div class="dealynx-skeleton-line dealynx-skeleton-line-short"></div>
       </div>
-    `).join('');
+    `;
+    return `
+      <div class="dealynx-insights-loading">
+        <div class="dealynx-loading-header" role="status" aria-live="polite">
+          <span class="dealynx-loading-spinner" aria-hidden="true"></span>
+          <span class="dealynx-loading-text">Analyzing captured pages…</span>
+        </div>
+        <div class="dealynx-insights-skeleton">
+          ${Array.from({ length: 3 }).map(() => skeletonCard()).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderProfileOverview(report) {
+    const profile = report.profile || {};
+    const metrics = report.metrics || {};
+    const chips = [];
+    if (typeof metrics.fitScore === "number") {
+      chips.push(`<span class="dealynx-report-chip dealynx-chip-emphasis">Fit • ${Math.round(metrics.fitScore)}/100</span>`);
+    }
+    if (typeof metrics.engagementScore === "number") {
+      chips.push(`<span class="dealynx-report-chip">Engagement • ${metrics.engagementScore}</span>`);
+    }
+    if (metrics.sentiment) {
+      chips.push(`<span class="dealynx-report-chip">Sentiment • ${escapeHtml(metrics.sentiment)}</span>`);
+    }
+    if (metrics.freshness) {
+      chips.push(`<span class="dealynx-report-chip">Freshness • ${escapeHtml(metrics.freshness)}</span>`);
+    }
+
+    const verdict = report.verdict || {};
+    let verdictBlock = "";
+    const rationaleList = Array.isArray(verdict.rationale)
+      ? verdict.rationale.map((item) => formatReportEntry(item)).filter(Boolean)
+      : [];
+    if (verdict.fitVerdict || verdict.confidence || rationaleList.length) {
+      verdictBlock = `
+        <div class="dealynx-verdict">
+          ${verdict.fitVerdict ? `<div class="dealynx-report-verdict">${escapeHtml(verdict.fitVerdict)}</div>` : ""}
+          ${verdict.confidence ? `<div class="dealynx-report-footnote">Confidence • ${escapeHtml(verdict.confidence)}</div>` : ""}
+          ${rationaleList.length ? `<ul class="dealynx-verdict-list">${rationaleList.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+        </div>
+      `;
+    }
+
+    const summaryText = report.summary
+      ? `<p class="dealynx-report-body">${escapeHtml(truncateText(report.summary, 360))}</p>`
+      : "";
+
+    return `
+      <div class="dealynx-report-card dealynx-report-profile">
+        <div class="dealynx-report-title">Prospect Overview</div>
+        <div class="dealynx-report-profile-header">
+          <div class="dealynx-report-profile-name">${escapeHtml(profile.name || "Prospect profile")}</div>
+          <div class="dealynx-report-profile-role">${escapeHtml(profile.role || "Role to be determined")}</div>
+          <div class="dealynx-report-profile-company">${escapeHtml(profile.company || "Company to be determined")}</div>
+        </div>
+        ${summaryText}
+        ${profile.location ? `<div class="dealynx-report-footnote">Location • ${escapeHtml(profile.location)}</div>` : ""}
+        ${chips.length ? `<div class="dealynx-report-chips">${chips.join("")}</div>` : ""}
+        ${verdictBlock}
+      </div>
+    `;
+  }
+
+  function renderKpiDeck(report) {
+    const kpis = Array.isArray(report.kpis) ? report.kpis.filter(Boolean).slice(0, 4) : [];
+    if (!kpis.length) return "";
+    const cards = kpis
+      .map((kpi) => {
+        const value = Number.isFinite(kpi.value) ? Math.round(kpi.value * 100) / 100 : 0;
+        const unit = kpi.unit || "";
+        const description = kpi.description
+          ? `<p class="dealynx-kpi-desc">${escapeHtml(truncateText(kpi.description, 200))}</p>`
+          : "";
+        return `
+          <div class="dealynx-kpi-card">
+            <div class="dealynx-kpi-label">${escapeHtml(kpi.label || "Metric")}</div>
+            <div class="dealynx-kpi-value">${value}<span class="dealynx-kpi-unit">${escapeHtml(unit)}</span></div>
+            ${description}
+          </div>
+        `;
+      })
+      .join("");
+    return `<div class="dealynx-kpi-grid">${cards}</div>`;
+  }
+
+  function renderChartBlocks(report) {
+    if (!report.charts || typeof report.charts !== "object") return "";
+    const entries = Object.entries(report.charts).filter(
+      ([, dataset]) => Array.isArray(dataset) && dataset.length
+    );
+    if (!entries.length) return "";
+
+    const cards = entries
+      .map(([name, dataset]) => {
+        const maxValue = Math.max(...dataset.map((point) => Number(point.value) || 0), 0) || 1;
+        const bars = dataset
+          .map((point) => {
+            const label = escapeHtml(point.label || point.name || "Item");
+            const rawValue = Number(point.value) || 0;
+            const value = Math.round(rawValue * 100) / 100;
+            const width = Math.max(6, Math.min(100, (Math.abs(rawValue) / maxValue) * 100));
+            return `
+              <div class="dealynx-chart-row">
+                <span class="dealynx-chart-label">${label}</span>
+                <div class="dealynx-chart-bar" style="--dealynx-bar-width:${width}%;"></div>
+                <span class="dealynx-chart-value">${value}</span>
+              </div>
+            `;
+          })
+          .join("");
+        return `
+          <div class="dealynx-chart-card">
+            <div class="dealynx-report-title">${escapeHtml(formatChartTitle(name))}</div>
+            <div class="dealynx-chart-bars">
+              ${bars}
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+
+    return `<div class="dealynx-chart-grid">${cards}</div>`;
+  }
+
+  function renderReportSections(report) {
+    if (Array.isArray(report.sections) && report.sections.length) {
+      return report.sections
+        .map((section) => {
+          if (!section || typeof section !== "object") return "";
+          const items = Array.isArray(section.items)
+            ? section.items.map((entry) => `<li>${escapeHtml(formatReportEntry(entry))}</li>`).filter(Boolean)
+            : [];
+          if (!items.length) return "";
+          return `
+            <div class="dealynx-report-card">
+              <div class="dealynx-report-title">${escapeHtml(section.title || "Insights")}</div>
+              <ul class="dealynx-report-list">
+                ${items.join("")}
+              </ul>
+            </div>
+          `;
+        })
+        .filter(Boolean);
+    }
+
+    const labels = {
+      background: "Professional Background",
+      engagements: "Engagement Signals",
+      motivations: "Motivations & Interests",
+      communication: "Communication Style",
+      outreach: "Outreach Suggestions",
+      takeaways: "Key Takeaways",
+      hooks: "Conversation Hooks"
+    };
+
+    return Object.entries(labels)
+      .filter(([key]) => Array.isArray(report[key]) && report[key].length > 0)
+      .map(([key, label]) => {
+        const items = report[key]
+          .map((entry) => {
+            const text = formatReportEntry(entry);
+            return text ? `<li>${escapeHtml(text)}</li>` : "";
+          })
+          .filter(Boolean)
+          .join("");
+        if (!items) return "";
+        return `
+          <div class="dealynx-report-card">
+            <div class="dealynx-report-title">${escapeHtml(label)}</div>
+            <ul class="dealynx-report-list">
+              ${items}
+            </ul>
+          </div>
+        `;
+      })
+      .filter(Boolean);
+  }
+
+  function renderHighlightsCard(highlights) {
+    if (!Array.isArray(highlights) || highlights.length === 0) {
+      return "";
+    }
+    const items = highlights
+      .slice(0, 6)
+      .map((highlight) => {
+        const text = formatReportEntry(highlight);
+        if (!text) return "";
+        if (highlight && typeof highlight === "object" && highlight.url) {
+          const safeUrl = escapeHtml(highlight.url);
+          return `<li><a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(text)}</a></li>`;
+        }
+        return `<li>${escapeHtml(text)}</li>`;
+      })
+      .filter(Boolean)
+      .join("");
+
+    if (!items) return "";
+    return `
+      <div class="dealynx-report-card">
+        <div class="dealynx-report-title">Recent Highlights</div>
+        <ul class="dealynx-report-list">
+          ${items}
+        </ul>
+      </div>
+    `;
+  }
+
+  function formatReportEntry(entry) {
+    if (!entry) return "";
+    if (typeof entry === "string") return entry;
+    if (typeof entry !== "object") return String(entry);
+    if (entry.text) return entry.text;
+    if (entry.summary) return entry.summary;
+    if (entry.description) return entry.description;
+    const values = Object.values(entry).filter((value) => typeof value === "string" && value.trim().length > 0);
+    return values.join(" • ");
+  }
+
+  function formatChartTitle(key) {
+    if (!key) return "Chart";
+    const words = key
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/[_-]+/g, " ")
+      .split(" ")
+      .map((word) => capitalize(word.toLowerCase()))
+      .filter(Boolean);
+    return words.join(" ") || "Chart";
+  }
+
+  function truncateText(text, limit = 360) {
+    if (!text) return "";
+    return text.length > limit ? `${text.slice(0, limit)}…` : text;
+  }
+
+  function clampScore(value) {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(100, Math.round(value)));
   }
 
   function escapeHtml(text) {
@@ -982,12 +1279,22 @@
 
   function renderSessionControls() {
     // Update button states
-    const startButtons = ui.sidebar.querySelectorAll('[data-action="start-session"], [data-action="start-analysis"]');
+    const startButtons = ui.sidebar.querySelectorAll('[data-action="start-session"]');
     const captureButton = ui.sidebar.querySelector('[data-action="capture-view"]');
     const endButton = ui.sidebar.querySelector('[data-action="end-session"]');
 
+    if (ui.productDescriptionInput && ui.productDescriptionInput.value !== state.productDescription) {
+      ui.productDescriptionInput.value = state.productDescription;
+    }
+
+    if (ui.productDescriptionInput) {
+      ui.productDescriptionInput.disabled = state.sessionActive || state.loadingFlags.connecting;
+    }
+
+    const disableStart =
+      state.sessionActive || state.loadingFlags.connecting || !state.productDescription.trim();
     startButtons.forEach(button => {
-      button.disabled = state.sessionActive || state.loadingFlags.connecting;
+      button.disabled = disableStart;
     });
 
     if (captureButton) {
@@ -1007,6 +1314,8 @@
       statusLabel = "Analyzing…";
     } else if (state.sessionActive) {
       statusLabel = `Active • ${state.captures.length} capture${state.captures.length === 1 ? "" : "s"}`;
+    } else if (state.analysisError) {
+      statusLabel = "Analysis failed";
     } else if (state.reportReady) {
       statusLabel = "Complete";
     }
@@ -1061,19 +1370,22 @@
         name: "Awaiting insight",
         role: "—",
         company: "—",
-        summary: "Start a session and capture a few pages to generate the AI report.",
+        summary: "",
         location: "—"
       },
-      background: [],
-      engagements: [],
-      motivations: [],
-      communication: [],
-      outreach: [],
-      takeaways: [],
-      hooks: [],
-      highlights: [],
+      summary: "",
       keywords: [],
+      highlights: [],
+      kpis: [],
+      sections: [],
+      charts: {},
+      verdict: {
+        fitVerdict: "Awaiting analysis",
+        confidence: "Low",
+        rationale: []
+      },
       metrics: {
+        fitScore: 0,
         engagementScore: 0,
         sentiment: "Neutral",
         freshness: "No data"
@@ -1091,7 +1403,8 @@
         },
         body: JSON.stringify({
           client: "dealynx-chrome",
-          started_at: new Date().toISOString()
+          started_at: new Date().toISOString(),
+          product_description: state.productDescription.trim()
         })
       },
       () => ({ session_id: `stub-${Date.now()}` })
@@ -1123,33 +1436,17 @@
       { method: "GET" },
       () => generateReportFromCaptures(captures)
     );
-    return response?.report || response;
+    if (response && typeof response === "object" && "report" in response) {
+      const payload = response.report && typeof response.report === "object" ? { ...response.report } : response.report;
+      if (response.offline && payload && typeof payload === "object") {
+        payload.__offline = true;
+      }
+      return payload;
+    }
+    return response;
   }
 
-  async function requestChatCompletion(sessionId, prompt) {
-    if (!sessionId) {
-      return { text: generateAgentResponse(prompt), offline: true };
-    }
-    const endpoint = `/sessions/${encodeURIComponent(sessionId)}/chat`;
-    const response = await performApiCall(
-      endpoint,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: prompt })
-      },
-      () => ({ reply: generateAgentResponse(prompt) })
-    );
-    const offline = response && typeof response === "object" && response.__offline;
-    if (response && typeof response === "object") {
-      delete response.__offline;
-    }
-    const text =
-      typeof response === "string"
-        ? response
-        : response?.reply || response?.message || generateAgentResponse(prompt);
-    return { text, offline };
-  }
+
 
   async function performApiCall(path, options, fallback) {
     const finalOptions = {
@@ -1185,6 +1482,9 @@
         const fallbackResult = await fallback(error);
         if (fallbackResult && typeof fallbackResult === "object" && !Array.isArray(fallbackResult)) {
           fallbackResult.__offline = true;
+          if (!('offline' in fallbackResult)) {
+            fallbackResult.offline = true;
+          }
         }
         return fallbackResult;
       }
@@ -1204,34 +1504,196 @@
       keywords: capture.keywords,
       highlights: capture.highlights,
       sentiment: capture.sentiment,
-      raw_text: capture.rawText
+      raw_text: capture.rawText,
+      dom_snapshot: capture.domSnapshot
     };
   }
 
   function normaliseReportPayload(raw) {
     const base = createEmptyReport();
-    if (!raw) {
+    if (!raw || typeof raw !== "object") {
       return base;
     }
 
     if (raw.profile && typeof raw.profile === "object") {
       base.profile = { ...base.profile, ...raw.profile };
     }
-    REPORT_SECTIONS.forEach((section) => {
-      const value = raw[section];
-      if (Array.isArray(value)) {
-        base[section] = value;
-      }
-    });
     if (Array.isArray(raw.keywords)) {
       base.keywords = raw.keywords;
     }
-    if (raw.metrics && typeof raw.metrics === "object") {
-      base.metrics = { ...base.metrics, ...raw.metrics };
+    if (typeof raw.summary === "string") {
+      base.summary = raw.summary;
     }
+    base.metrics = { ...base.metrics, ...normaliseMetrics(raw.metrics) };
+    base.kpis = normaliseKpis(raw.kpis, base.metrics);
+    base.sections = normaliseSections(raw) || base.sections;
+    base.charts = normaliseCharts(raw.charts, base.keywords);
+    base.verdict = normaliseVerdict(raw.verdict, base.metrics);
     base.highlights = normaliseHighlights(raw.highlights || base.highlights);
     return base;
   }
+
+  function normaliseMetrics(metrics) {
+    if (!metrics || typeof metrics !== "object") {
+      return {};
+    }
+    const result = {};
+    if (typeof metrics.fitScore === "number") {
+      result.fitScore = clampScore(metrics.fitScore);
+    } else if (typeof metrics.fit_score === "number") {
+      result.fitScore = clampScore(metrics.fit_score);
+    }
+    if (typeof metrics.engagementScore === "number") {
+      result.engagementScore = clampScore(metrics.engagementScore);
+    }
+    if (typeof metrics.sentiment === "string") {
+      result.sentiment = metrics.sentiment;
+    }
+    if (typeof metrics.freshness === "string") {
+      result.freshness = metrics.freshness;
+    }
+    return result;
+  }
+
+  function normaliseKpis(kpis, metrics = {}) {
+    if (Array.isArray(kpis) && kpis.length) {
+      return kpis
+        .map((item) => {
+          if (!item || typeof item !== "object") return null;
+          const value = typeof item.value === "number" ? item.value : Number(item.value);
+          return {
+            label: item.label || item.name || "Metric",
+            value: Number.isFinite(value) ? Math.round(value * 100) / 100 : 0,
+            unit: item.unit || item.units || (item.value && String(item.value).includes("%") ? "%" : ""),
+            description: item.description || item.insight || ""
+          };
+        })
+        .filter(Boolean)
+        .slice(0, 5);
+    }
+
+    const derived = [];
+    if (typeof metrics.fitScore === "number") {
+      derived.push({
+        label: "Solution Fit",
+        value: metrics.fitScore,
+        unit: "/100",
+        description: "Overall alignment between prospect needs and product value proposition."
+      });
+    }
+    if (typeof metrics.engagementScore === "number") {
+      derived.push({
+        label: "Engagement Signals",
+        value: metrics.engagementScore,
+        unit: "/100",
+        description: "Strength of recent activity and topical focus across captured pages."
+      });
+    }
+    if (derived.length === 0) {
+      derived.push({
+        label: "Analysis Pending",
+        value: 0,
+        unit: "/100",
+        description: "Capture prospect content to unlock quantitative KPIs."
+      });
+    }
+    return derived;
+  }
+
+  function normaliseSections(raw) {
+    if (Array.isArray(raw.sections) && raw.sections.length) {
+      return raw.sections
+        .map((section) => {
+          if (!section || typeof section !== "object") return null;
+          const items = Array.isArray(section.items)
+            ? section.items.map((entry) => formatReportEntry(entry)).filter(Boolean)
+            : [];
+          if (!items.length) return null;
+          return {
+            title: section.title || section.name || "Insights",
+            items
+          };
+        })
+        .filter(Boolean);
+    }
+
+    const fallbackMap = [
+      ["background", "Professional Background"],
+      ["engagements", "Engagement Signals"],
+      ["motivations", "Motivations & Interests"],
+      ["communication", "Communication Style"],
+      ["outreach", "Outreach Suggestions"],
+      ["takeaways", "Key Takeaways"],
+      ["hooks", "Conversation Hooks"]
+    ];
+
+    const sections = fallbackMap
+      .map(([key, label]) => {
+        const value = raw[key];
+        if (!Array.isArray(value) || !value.length) return null;
+        const items = value.map((entry) => formatReportEntry(entry)).filter(Boolean);
+        if (!items.length) return null;
+        return { title: label, items };
+      })
+      .filter(Boolean);
+
+    return sections;
+  }
+
+  function normaliseCharts(charts, keywords = []) {
+    const result = {};
+    if (charts && typeof charts === "object") {
+      for (const [name, dataset] of Object.entries(charts)) {
+        if (!Array.isArray(dataset)) continue;
+        const normalised = dataset
+          .map((point) => {
+            if (!point || typeof point !== "object") return null;
+            const raw = point.value;
+            const value = typeof raw === "number" ? raw : parseFloat(String(raw).replace(/[^0-9.-]/g, ""));
+            if (!Number.isFinite(value)) return null;
+            return {
+              label: point.label || point.name || "",
+              value: Math.max(0, Math.round(value * 100) / 100)
+            };
+          })
+          .filter(Boolean);
+        if (normalised.length) {
+          result[name] = normalised.slice(0, 6);
+        }
+      }
+    }
+
+    if (!Object.keys(result).length && Array.isArray(keywords) && keywords.length) {
+      result.interestBreakdown = keywords.slice(0, 6).map((keyword, index) => ({
+        label: typeof keyword === "string" ? capitalize(keyword) : `Topic ${index + 1}`,
+        value: Math.max(1, 6 - index)
+      }));
+    }
+
+    return result;
+  }
+
+  function normaliseVerdict(verdict, metrics = {}) {
+    if (verdict && typeof verdict === "object") {
+      const rationale = Array.isArray(verdict.rationale)
+        ? verdict.rationale.map((item) => formatReportEntry(item)).filter(Boolean)
+        : [];
+      return {
+        fitVerdict: verdict.fitVerdict || verdict.verdict || "Potential pending",
+        confidence: verdict.confidence || "Medium",
+        rationale
+      };
+    }
+
+    const fitScore = typeof metrics.fitScore === "number" ? metrics.fitScore : 0;
+    const confidence = fitScore >= 70 ? "High" : fitScore >= 45 ? "Medium" : "Low";
+    return {
+      fitVerdict: fitScore >= 70 ? "High Potential" : fitScore >= 45 ? "Moderate Potential" : "Low Potential",
+      confidence,
+      rationale: []
+    };
+  }
+
 
   function normaliseHighlights(items) {
     if (!Array.isArray(items)) return [];
