@@ -11,12 +11,19 @@ This directory contains the front-end Chrome Extension for the DeaLynx prospect 
 * **Chat Panel:** Streams prompts to a stubbed `/chat` endpoint and displays typing indicators.
 
 ## Project Structure
-chrome-extension/
-├── background.js        # Handles toolbar action clicks to toggle the sidebar
-├── contentScript.js     # Injects the sidebar, manages session state, orchestrates API calls
-├── contentStyles.css    # Dark theme styling, loaders, skeletons, capture overlay
-├── manifest.json        # Chrome extension manifest (MV3)
-└── README.md            # This file
+You are 100% right. That single line of text is very hard to read.
+
+The problem is that you are not using a code block. In Markdown, any text that isn't in a code block will have its newlines and extra spaces "collapsed" into a single, uneven line.
+
+To fix this, you need to wrap your file structure in triple backticks (```). This tells GitHub to render the text exactly as you typed it, preserving all the newlines and spacing.
+
+Here is the corrected code. Just copy and paste this into your README.md to replace the old "Project Structure" section.
+
+Markdown
+
+## Project Structure
+
+chrome-extension/ ├── background.js # Handles toolbar action clicks to toggle the sidebar ├── contentScript.js # Injects the sidebar, manages session state, orchestrates API calls ├── contentStyles.css # Dark theme styling, loaders, skeletons, capture overlay ├── manifest.json # Chrome extension manifest (MV3) └── README.md # This file
 
 ## Installing the Extension Locally
 
