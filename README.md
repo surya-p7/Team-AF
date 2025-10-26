@@ -22,13 +22,13 @@ Here is the corrected code. Just copy and paste this into your README.md to repl
 Markdown
 
 ## Project Structure
-'''
+```
 chrome-extension/ 
 ├── background.js # Handles toolbar action clicks to toggle the sidebar 
 ├── contentScript.js # Injects the sidebar, manages session state, orchestrates API calls 
 ├── contentStyles.css # Dark theme styling, loaders, skeletons, capture overlay 
 ├── manifest.json # Chrome extension manifest (MV3) └── README.md # This file
-'''
+```
 
 ## Installing the Extension Locally
 
